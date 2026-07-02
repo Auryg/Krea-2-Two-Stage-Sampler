@@ -1,0 +1,17 @@
+[project]
+name = "krea2-twostage-sampler"
+description = "Sigma-locked two-stage sampler and dual resolution selector for Krea 2 (and possibly other) workflows in ComfyUI."
+version = "0.1.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = []
+classifiers = ["Operating System :: OS Independent"]
+
+[project.urls]
+Repository = "https://github.com/Auryg/Krea-2-Two-Stage-Sampler"
+"Bug Tracker" = "https://github.com/Auryg/Krea-2-Two-Stage-Sampler/issues"
+
+[tool.comfy]
+PublisherId = "ashen3"
+DisplayName = "Two-Stage Sampler and Krea 2 Resolution Picker"
+Icon = "https://raw.githubusercontent.com/Auryg/Krea-2-Two-Stage-Sampler/main/images/icon.png"

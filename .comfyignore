@@ -1,0 +1,6 @@
+# Development-only assets
+docs/
+tests/
+*.psd
+.vscode/
+images/
