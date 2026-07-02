@@ -22,5 +22,5 @@ Installation: Put in the custom_nodes folder or grab from ComfyUI manager.
 
 Here's an image with a sample workflow:
 
-!\[Krea 2 raw-to-turbo LoRA workflow](images/TwoStageKrea.png)
+![Krea 2 raw-to-turbo LoRA workflow](images/TwoStageKrea.png)
 
