@@ -16,9 +16,11 @@ Because of that I've also includes a dual resolution node - select the aspect ra
 
 The main know you'll want to play with is the handoff\_percent.  There's no right answer on what it should be.  
 
+Installation: Put in the custom_nodes folder or grab from ComfyUI manager. 
+
 
 
 Here's an image with a sample workflow:
 
-!\[Krea 2 raw-to-turbo LoRA workflow](images/TwoStageKrea.jpg)
+!\[Krea 2 raw-to-turbo LoRA workflow](images/TwoStageKrea.png)
 
