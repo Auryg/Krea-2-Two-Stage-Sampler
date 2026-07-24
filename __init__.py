@@ -26,7 +26,19 @@ FIXED_ASPECT_RATIOS = {
 }
 
 
-ASPECT_RATIOS = {"Random": None, **FIXED_ASPECT_RATIOS}
+RANDOM_ASPECT_RATIO_MODES = {
+    "Random": tuple(FIXED_ASPECT_RATIOS),
+    "Random Vertical": tuple(
+        name for name, (width, height) in FIXED_ASPECT_RATIOS.items() if height > width
+    ),
+    "Random Horizontal": tuple(
+        name for name, (width, height) in FIXED_ASPECT_RATIOS.items() if width > height
+    ),
+    "Random Constrained": ("1:1", "4:5", "5:4", "2:3", "3:2", "3:4", "4:3"),
+}
+
+
+ASPECT_RATIOS = {**dict.fromkeys(RANDOM_ASPECT_RATIO_MODES), **FIXED_ASPECT_RATIOS}
 UPSCALE_METHODS = ["nearest-exact", "bilinear", "area", "bicubic", "bislerp"]
 
 
@@ -37,10 +49,10 @@ def _round_to_multiple(value, multiple):
 
 
 def _resolve_aspect_ratio(aspect_ratio, random_seed):
-    if aspect_ratio != "Random":
+    if aspect_ratio not in RANDOM_ASPECT_RATIO_MODES:
         return aspect_ratio
 
-    aspect_names = list(FIXED_ASPECT_RATIOS.keys())
+    aspect_names = RANDOM_ASPECT_RATIO_MODES[aspect_ratio]
     return aspect_names[random.Random(random_seed).randrange(len(aspect_names))]
 
 

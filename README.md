@@ -10,7 +10,7 @@ A Sigma-locked two-stage sampler with separate inputs for models for each.  The 
 
 
 
-Because of that I've also includes a dual resolution node - select the aspect ratio and the base and final megapixels.  It also includes a random mode for the aspect ratio.  The included aspect ratios are specifically tailored for Krea 2.
+Because of that I've also included a dual resolution node—select the aspect ratio and the base and final megapixels. It includes random modes covering all ratios, vertical ratios, horizontal ratios, or a constrained set (1:1, 4:5, 5:4, 2:3, 3:2, 3:4, and 4:3). The included aspect ratios are specifically tailored for Krea 2.
 
 
 
