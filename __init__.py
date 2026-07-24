@@ -266,15 +266,15 @@ class KreaDualResolutionSelector:
             }
         }
 
-    RETURN_TYPES = ("INT", "INT", "INT", "INT")
-    RETURN_NAMES = ("base_width", "base_height", "final_width", "final_height")
+    RETURN_TYPES = ("INT", "INT", "INT", "INT", "INT")
+    RETURN_NAMES = ("base_width", "base_height", "final_width", "final_height", "seed")
     FUNCTION = "execute"
     CATEGORY = "Ashen3"
 
     def execute(self, aspect_ratio, base_megapixels, final_megapixels, multiple, random_seed=0):
         base_width, base_height = _dimensions_for(aspect_ratio, base_megapixels, multiple, random_seed)
         final_width, final_height = _dimensions_for(aspect_ratio, final_megapixels, multiple, random_seed)
-        return (base_width, base_height, final_width, final_height)
+        return (base_width, base_height, final_width, final_height, random_seed)
 
 
 class KreaTwoStageSampler:
