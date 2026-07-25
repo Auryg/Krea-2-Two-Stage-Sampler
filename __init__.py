@@ -288,7 +288,20 @@ class KreaTwoStageSampler:
                 "negative": ("CONDITIONING",),
                 "latent_image": ("LATENT",),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
-                "handoff_percent": ("FLOAT", {"default": 16.67, "min": 0.01, "max": 99.99, "step": 0.01, "round": 0.01}),
+                "handoff_percent": (
+                    "FLOAT",
+                    {
+                        "default": 16.67,
+                        "min": 0.0,
+                        "max": 100.0,
+                        "step": 0.01,
+                        "round": 0.01,
+                        "tooltip": (
+                            "Point in the denoising process where stage 1 hands off to stage 2. "
+                            "0% uses only stage 2; 100% uses only stage 1."
+                        ),
+                    },
+                ),
                 "stage1_steps": ("INT", {"default": 52, "min": 2, "max": 10000}),
                 "stage1_cfg": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
                 "stage1_sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
@@ -329,6 +342,69 @@ class KreaTwoStageSampler:
         final_height,
         upscale_method="bislerp",
     ):
+        if handoff_percent <= 0.0:
+            stage2_sigmas = _sigma_schedule(
+                stage2_model,
+                stage2_steps,
+                stage2_sampler_name,
+                stage2_scheduler,
+            )
+            stage2_input, did_upscale = _upscale_latent_if_needed(
+                latent_image,
+                stage2_model,
+                final_width,
+                final_height,
+                upscale_method,
+            )
+            stage2_negative = (
+                _zero_out_conditioning(negative)
+                if math.isclose(stage2_cfg, 1.0, rel_tol=0.0, abs_tol=1e-6)
+                else negative
+            )
+            print(
+                "Krea Two-Stage Sampler: "
+                f"stage2_only=true, stage2_steps={len(stage2_sigmas) - 1}, "
+                f"resized_input={str(did_upscale).lower()}"
+            )
+            stage2 = _sample_with_sigmas(
+                stage2_model,
+                seed,
+                stage2_cfg,
+                stage2_sampler_name,
+                stage2_scheduler,
+                positive,
+                stage2_negative,
+                stage2_input,
+                stage2_sigmas,
+                disable_noise=False,
+            )
+            return (stage2,)
+
+        if handoff_percent >= 100.0:
+            stage1_sigmas = _sigma_schedule(
+                stage1_model,
+                stage1_steps,
+                stage1_sampler_name,
+                stage1_scheduler,
+            )
+            print(
+                "Krea Two-Stage Sampler: "
+                f"stage1_only=true, stage1_steps={len(stage1_sigmas) - 1}"
+            )
+            stage1 = _sample_with_sigmas(
+                stage1_model,
+                seed,
+                stage1_cfg,
+                stage1_sampler_name,
+                stage1_scheduler,
+                positive,
+                negative,
+                latent_image,
+                stage1_sigmas,
+                disable_noise=False,
+            )
+            return (stage1,)
+
         stage1_sigmas, stage2_sigmas, stage1_end, stage2_start, boundary_sigma = _build_sigma_pair(
             stage1_model,
             stage2_model,

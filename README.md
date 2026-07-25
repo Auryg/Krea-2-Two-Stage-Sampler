@@ -14,7 +14,7 @@ Because of that I've also included a dual resolution node—select the aspect ra
 
 
 
-The main knob you'll want to play with is the handoff\_percent.  There's no right answer on what it should be.  
+The main knob you'll want to play with is `handoff_percent`, which sets the point in the denoising process where stage 1 hands off to stage 2. For example, at 25%, stage 1 handles the first 25% and stage 2 handles the remaining 75%. At 0%, stage 2 performs the full generation; at 100%, stage 1 performs the full generation. There's no single right answer for where it should be set.
 
 Installation: Put in the custom_nodes folder or grab from ComfyUI manager. 
 
