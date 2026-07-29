@@ -4,6 +4,7 @@ import random
 import torch
 
 import comfy.model_management
+import comfy.model_sampling
 import comfy.sample
 import comfy.samplers
 import comfy.utils
@@ -66,6 +67,18 @@ def _dimensions_for(aspect_ratio, megapixels, multiple, random_seed=0):
     return width, height
 
 
+def _krea2_raw_shift(width, height):
+    min_tokens = 256
+    max_tokens = 6400
+    min_shift = 0.5
+    max_shift = 1.15
+    sampling_width = math.ceil(width / 16) * 16
+    sampling_height = math.ceil(height / 16) * 16
+    image_tokens = sampling_width * sampling_height / (8 * 8 * 2 * 2)
+    slope = (max_shift - min_shift) / (max_tokens - min_tokens)
+    return slope * image_tokens + (min_shift - slope * min_tokens)
+
+
 def _sigma_schedule(model, steps, sampler_name, scheduler):
     device = getattr(model, "load_device", comfy.model_management.get_torch_device())
     sampler = comfy.samplers.KSampler(
@@ -84,48 +97,163 @@ def _clamp(value, low, high):
     return max(low, min(high, value))
 
 
-def _stage2_start_index(stage2_steps, stage2_sigmas, handoff_percent):
-    max_start = len(stage2_sigmas) - 2
-    if max_start < 1:
-        raise ValueError("stage2_steps must produce at least one non-terminal handoff sigma.")
-    requested = round(stage2_steps * handoff_percent / 100.0)
-    return _clamp(requested, 1, max_start)
+def _percent_schedule_index(steps, sigmas, handoff_percent, stage_name):
+    max_index = len(sigmas) - 2
+    if max_index < 1:
+        raise ValueError(
+            f"{stage_name} must produce at least one non-terminal handoff sigma."
+        )
+    requested = round(steps * handoff_percent / 100.0)
+    return _clamp(requested, 1, max_index)
 
 
-def _nearest_stage1_end_index(stage1_sigmas, boundary_sigma):
-    max_end = len(stage1_sigmas) - 2
-    if max_end < 1:
-        raise ValueError("stage1_steps must produce at least one non-terminal handoff sigma.")
+def _nearest_schedule_index(
+    sigmas,
+    boundary_sigma,
+    minimum_index,
+    stage_name,
+):
+    max_index = len(sigmas) - 2
+    if max_index < minimum_index:
+        raise ValueError(
+            f"{stage_name} does not have enough non-terminal sigmas for this handoff."
+        )
 
     boundary = float(boundary_sigma)
     if boundary <= 0.0:
         raise ValueError("The handoff sigma must be greater than zero.")
-    if boundary >= float(stage1_sigmas[0]):
+    if boundary >= float(sigmas[0]):
         raise ValueError(
-            "The stage-2 handoff sigma is outside the stage-1 schedule. "
-            "Use a later handoff percent or compatible model sampling settings."
+            f"The handoff sigma is outside the {stage_name} schedule. "
+            "Use compatible model sampling settings or move the handoff later."
         )
 
-    candidates = [idx for idx in range(1, max_end + 1) if float(stage1_sigmas[idx - 1]) > boundary]
+    candidates = [
+        idx
+        for idx in range(minimum_index, max_index + 1)
+        if float(sigmas[idx - 1]) > boundary
+    ]
     if not candidates:
-        raise ValueError("Could not find a valid stage-1 handoff step for the boundary sigma.")
+        raise ValueError(
+            f"Could not find a valid {stage_name} handoff step. "
+            "Use compatible model sampling settings or move the handoffs farther apart."
+        )
 
-    return min(candidates, key=lambda idx: abs(float(stage1_sigmas[idx]) - boundary))
+    return min(candidates, key=lambda idx: abs(float(sigmas[idx]) - boundary))
 
 
 def _build_sigma_pair(stage1_model, stage2_model, stage1_steps, stage2_steps, stage1_sampler, stage1_scheduler, stage2_sampler, stage2_scheduler, handoff_percent):
     stage1_sigmas = _sigma_schedule(stage1_model, stage1_steps, stage1_sampler, stage1_scheduler)
     stage2_sigmas = _sigma_schedule(stage2_model, stage2_steps, stage2_sampler, stage2_scheduler)
 
-    stage2_start = _stage2_start_index(stage2_steps, stage2_sigmas, handoff_percent)
-    boundary_sigma = stage2_sigmas[stage2_start].clone()
-    stage1_end = _nearest_stage1_end_index(stage1_sigmas, boundary_sigma)
+    stage1_end = _percent_schedule_index(
+        stage1_steps,
+        stage1_sigmas,
+        handoff_percent,
+        "stage 1",
+    )
+    boundary_sigma = stage1_sigmas[stage1_end].clone()
+    stage2_start = _nearest_schedule_index(
+        stage2_sigmas,
+        boundary_sigma,
+        1,
+        "stage 2",
+    )
 
-    stage1_custom = torch.cat((stage1_sigmas[:stage1_end], boundary_sigma.reshape(1)))
+    stage1_custom = stage1_sigmas[:stage1_end + 1].clone()
     stage2_custom = stage2_sigmas[stage2_start:].clone()
     stage2_custom[0] = boundary_sigma
 
     return stage1_custom, stage2_custom, stage1_end, stage2_start, float(boundary_sigma)
+
+
+def _build_sigma_triplet(
+    stage1_model,
+    stage2_model,
+    stage1_steps,
+    stage2_steps,
+    stage1_sampler,
+    stage1_scheduler,
+    stage2_sampler,
+    stage2_scheduler,
+    handoff_percent,
+    stage3_handoff_percent,
+):
+    stage1_full = _sigma_schedule(
+        stage1_model,
+        stage1_steps,
+        stage1_sampler,
+        stage1_scheduler,
+    )
+    stage2_full = _sigma_schedule(
+        stage2_model,
+        stage2_steps,
+        stage2_sampler,
+        stage2_scheduler,
+    )
+
+    stage3_start = _percent_schedule_index(
+        stage1_steps,
+        stage1_full,
+        stage3_handoff_percent,
+        "stage 1",
+    )
+    stage2_end_sigma = stage1_full[stage3_start].clone()
+
+    stage1_custom = None
+    stage1_end = None
+    stage1_end_sigma = None
+    if handoff_percent <= 0.0:
+        stage2_start = 0
+    else:
+        stage1_end = _percent_schedule_index(
+            stage1_steps,
+            stage1_full,
+            handoff_percent,
+            "stage 1",
+        )
+        stage1_end_sigma = stage1_full[stage1_end].clone()
+        stage1_custom = stage1_full[:stage1_end + 1].clone()
+        stage2_start = _nearest_schedule_index(
+            stage2_full,
+            stage1_end_sigma,
+            1,
+            "stage 2",
+        )
+
+        if float(stage2_end_sigma) >= float(stage1_end_sigma):
+            raise ValueError(
+                "stage3_handoff_percent must produce a later denoising sigma than "
+                "handoff_percent. Move the handoffs farther apart or use compatible "
+                "model sampling settings."
+            )
+
+    stage2_end = _nearest_schedule_index(
+        stage2_full,
+        stage2_end_sigma,
+        stage2_start + 1,
+        "stage 2",
+    )
+    stage2_custom = torch.cat(
+        (stage2_full[stage2_start:stage2_end], stage2_end_sigma.reshape(1))
+    )
+    if stage1_end_sigma is not None:
+        stage2_custom[0] = stage1_end_sigma
+
+    stage3_custom = stage1_full[stage3_start:].clone()
+    stage3_custom[0] = stage2_end_sigma
+
+    return (
+        stage1_custom,
+        stage2_custom,
+        stage3_custom,
+        stage1_end,
+        stage2_start,
+        stage2_end,
+        stage3_start,
+        None if stage1_end_sigma is None else float(stage1_end_sigma),
+        float(stage2_end_sigma),
+    )
 
 
 def _sample_with_sigmas(model, seed, cfg, sampler_name, scheduler, positive, negative, latent, sigmas, disable_noise):
@@ -275,6 +403,91 @@ class KreaDualResolutionSelector:
         base_width, base_height = _dimensions_for(aspect_ratio, base_megapixels, multiple, random_seed)
         final_width, final_height = _dimensions_for(aspect_ratio, final_megapixels, multiple, random_seed)
         return (base_width, base_height, final_width, final_height, random_seed)
+
+
+class Krea2ModelSampling:
+    MODES = ["raw_dynamic", "turbo_fixed", "manual"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "sampling_mode": (
+                    cls.MODES,
+                    {
+                        "default": "raw_dynamic",
+                        "tooltip": (
+                            "Raw uses Krea 2's official resolution-dependent shift. "
+                            "Turbo pins the shift to 1.15. Manual uses manual_shift."
+                        ),
+                    },
+                ),
+                "width": (
+                    "INT",
+                    {
+                        "default": 1024,
+                        "min": 16,
+                        "max": nodes.MAX_RESOLUTION,
+                        "step": 8,
+                        "tooltip": "Sampling width; used only by raw_dynamic.",
+                    },
+                ),
+                "height": (
+                    "INT",
+                    {
+                        "default": 1024,
+                        "min": 16,
+                        "max": nodes.MAX_RESOLUTION,
+                        "step": 8,
+                        "tooltip": "Sampling height; used only by raw_dynamic.",
+                    },
+                ),
+                "manual_shift": (
+                    "FLOAT",
+                    {
+                        "default": 1.15,
+                        "min": 0.0,
+                        "max": 100.0,
+                        "step": 0.01,
+                        "round": False,
+                        "advanced": True,
+                        "tooltip": "Constant shift used only by manual mode.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "Ashen3"
+
+    def patch(self, model, sampling_mode, width, height, manual_shift=1.15):
+        if sampling_mode == "raw_dynamic":
+            shift = _krea2_raw_shift(width, height)
+        elif sampling_mode == "turbo_fixed":
+            shift = 1.15
+        elif sampling_mode == "manual":
+            shift = manual_shift
+        else:
+            raise ValueError(f"Unknown Krea 2 sampling mode: {sampling_mode}")
+
+        class ModelSamplingKrea2(
+            comfy.model_sampling.ModelSamplingFlux,
+            comfy.model_sampling.CONST,
+        ):
+            pass
+
+        model_sampling = ModelSamplingKrea2(model.model.model_config)
+        model_sampling.set_parameters(shift=shift)
+        patched_model = model.clone()
+        patched_model.add_object_patch("model_sampling", model_sampling)
+
+        print(
+            "Krea 2 Model Sampling: "
+            f"mode={sampling_mode}, shift={shift:.8f}, width={width}, height={height}"
+        )
+        return (patched_model,)
 
 
 class KreaTwoStageSampler:
@@ -459,12 +672,304 @@ class KreaTwoStageSampler:
         return (stage2,)
 
 
+class KreaThreeStageSampler(KreaTwoStageSampler):
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = super().INPUT_TYPES()
+        required = {}
+        for name, definition in inputs["required"].items():
+            required[name] = definition
+            if name == "handoff_percent":
+                required["stage3_handoff_percent"] = (
+                    "FLOAT",
+                    {
+                        "default": 83.33,
+                        "min": 0.0,
+                        "max": 100.0,
+                        "step": 0.01,
+                        "round": 0.01,
+                        "tooltip": (
+                            "Point in the denoising process where stage 2 hands off "
+                            "to stage 3. Stage 3 reuses all stage 1 settings. This "
+                            "must be greater than or equal to handoff_percent."
+                        ),
+                    },
+                )
+        inputs["required"] = required
+        return inputs
+
+    def sample(
+        self,
+        stage1_model,
+        stage2_model,
+        positive,
+        negative,
+        latent_image,
+        seed,
+        handoff_percent,
+        stage3_handoff_percent,
+        stage1_steps,
+        stage1_cfg,
+        stage1_sampler_name,
+        stage1_scheduler,
+        stage2_steps,
+        stage2_cfg,
+        stage2_sampler_name,
+        stage2_scheduler,
+        final_width,
+        final_height,
+        upscale_method="bislerp",
+    ):
+        if stage3_handoff_percent < handoff_percent:
+            raise ValueError(
+                "stage3_handoff_percent must be greater than or equal to "
+                "handoff_percent."
+            )
+
+        if stage3_handoff_percent >= 100.0:
+            return super().sample(
+                stage1_model,
+                stage2_model,
+                positive,
+                negative,
+                latent_image,
+                seed,
+                handoff_percent,
+                stage1_steps,
+                stage1_cfg,
+                stage1_sampler_name,
+                stage1_scheduler,
+                stage2_steps,
+                stage2_cfg,
+                stage2_sampler_name,
+                stage2_scheduler,
+                final_width,
+                final_height,
+                upscale_method,
+            )
+
+        stage1_negative = negative
+
+        if math.isclose(
+            stage3_handoff_percent,
+            handoff_percent,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            if stage3_handoff_percent <= 0.0:
+                stage3_sigmas = _sigma_schedule(
+                    stage1_model,
+                    stage1_steps,
+                    stage1_sampler_name,
+                    stage1_scheduler,
+                )
+                stage3_input, did_upscale = _upscale_latent_if_needed(
+                    latent_image,
+                    stage1_model,
+                    final_width,
+                    final_height,
+                    upscale_method,
+                )
+                print(
+                    "Krea Three-Stage Sampler: "
+                    f"stage3_only=true, stage3_steps={len(stage3_sigmas) - 1}, "
+                    f"resized_input={str(did_upscale).lower()}"
+                )
+                stage3 = _sample_with_sigmas(
+                    stage1_model,
+                    seed,
+                    stage1_cfg,
+                    stage1_sampler_name,
+                    stage1_scheduler,
+                    positive,
+                    stage1_negative,
+                    stage3_input,
+                    stage3_sigmas,
+                    disable_noise=False,
+                )
+                return (stage3,)
+
+            stage1_full = _sigma_schedule(
+                stage1_model,
+                stage1_steps,
+                stage1_sampler_name,
+                stage1_scheduler,
+            )
+            stage3_start = _percent_schedule_index(
+                stage1_steps,
+                stage1_full,
+                stage3_handoff_percent,
+                "stage 1",
+            )
+            boundary_sigma = stage1_full[stage3_start].clone()
+            stage1_sigmas = stage1_full[:stage3_start + 1].clone()
+            stage3_sigmas = stage1_full[stage3_start:].clone()
+            upscale_requested = _will_upscale_latent(
+                latent_image,
+                stage1_model,
+                final_width,
+                final_height,
+            )
+            stage1_run_sigmas = stage1_sigmas.clone()
+            if upscale_requested:
+                stage1_run_sigmas[-1] = 0.0
+
+            print(
+                "Krea Three-Stage Sampler: "
+                f"stage2_skipped=true, stage1_end={stage3_start}, "
+                f"stage3_start={stage3_start}, boundary_sigma={float(boundary_sigma):.8f}, "
+                f"noise_mode={'fresh_high_res' if upscale_requested else 'carry_leftover'}"
+            )
+            stage1 = _sample_with_sigmas(
+                stage1_model,
+                seed,
+                stage1_cfg,
+                stage1_sampler_name,
+                stage1_scheduler,
+                positive,
+                stage1_negative,
+                latent_image,
+                stage1_run_sigmas,
+                disable_noise=False,
+            )
+            stage3_input, did_upscale = _upscale_latent_if_needed(
+                stage1,
+                stage1_model,
+                final_width,
+                final_height,
+                upscale_method,
+            )
+            stage3 = _sample_with_sigmas(
+                stage1_model,
+                seed,
+                stage1_cfg,
+                stage1_sampler_name,
+                stage1_scheduler,
+                positive,
+                stage1_negative,
+                stage3_input,
+                stage3_sigmas,
+                disable_noise=not did_upscale,
+            )
+            return (stage3,)
+
+        (
+            stage1_sigmas,
+            stage2_sigmas,
+            stage3_sigmas,
+            stage1_end,
+            stage2_start,
+            stage2_end,
+            stage3_start,
+            stage1_boundary_sigma,
+            stage2_boundary_sigma,
+        ) = _build_sigma_triplet(
+            stage1_model,
+            stage2_model,
+            stage1_steps,
+            stage2_steps,
+            stage1_sampler_name,
+            stage1_scheduler,
+            stage2_sampler_name,
+            stage2_scheduler,
+            handoff_percent,
+            stage3_handoff_percent,
+        )
+
+        if stage1_sigmas is None:
+            stage2_input, did_upscale = _upscale_latent_if_needed(
+                latent_image,
+                stage2_model,
+                final_width,
+                final_height,
+                upscale_method,
+            )
+            stage2_disable_noise = False
+            stage1_log = "stage1_skipped=true"
+        else:
+            upscale_requested = _will_upscale_latent(
+                latent_image,
+                stage2_model,
+                final_width,
+                final_height,
+            )
+            stage1_run_sigmas = stage1_sigmas.clone()
+            if upscale_requested:
+                stage1_run_sigmas[-1] = 0.0
+            stage1 = _sample_with_sigmas(
+                stage1_model,
+                seed,
+                stage1_cfg,
+                stage1_sampler_name,
+                stage1_scheduler,
+                positive,
+                stage1_negative,
+                latent_image,
+                stage1_run_sigmas,
+                disable_noise=False,
+            )
+            stage2_input, did_upscale = _upscale_latent_if_needed(
+                stage1,
+                stage2_model,
+                final_width,
+                final_height,
+                upscale_method,
+            )
+            stage2_disable_noise = not did_upscale
+            stage1_log = (
+                f"stage1_end={stage1_end}, "
+                f"stage1_boundary_sigma={stage1_boundary_sigma:.8f}"
+            )
+
+        stage2_negative = (
+            _zero_out_conditioning(negative)
+            if math.isclose(stage2_cfg, 1.0, rel_tol=0.0, abs_tol=1e-6)
+            else negative
+        )
+        print(
+            "Krea Three-Stage Sampler: "
+            f"{stage1_log}, stage2_start={stage2_start}, stage2_end={stage2_end}, "
+            f"stage3_start={stage3_start}, "
+            f"stage2_boundary_sigma={stage2_boundary_sigma:.8f}, "
+            f"noise_mode={'fresh_high_res' if not stage2_disable_noise else 'carry_leftover'}"
+        )
+        stage2 = _sample_with_sigmas(
+            stage2_model,
+            seed,
+            stage2_cfg,
+            stage2_sampler_name,
+            stage2_scheduler,
+            positive,
+            stage2_negative,
+            stage2_input,
+            stage2_sigmas,
+            disable_noise=stage2_disable_noise,
+        )
+        stage3 = _sample_with_sigmas(
+            stage1_model,
+            seed,
+            stage1_cfg,
+            stage1_sampler_name,
+            stage1_scheduler,
+            positive,
+            stage1_negative,
+            stage2,
+            stage3_sigmas,
+            disable_noise=True,
+        )
+        return (stage3,)
+
+
 NODE_CLASS_MAPPINGS = {
     "KreaDualResolutionSelector": KreaDualResolutionSelector,
+    "Krea2ModelSampling": Krea2ModelSampling,
     "KreaTwoStageSampler": KreaTwoStageSampler,
+    "KreaThreeStageSampler": KreaThreeStageSampler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "KreaDualResolutionSelector": "Krea Dual Resolution Selector",
+    "Krea2ModelSampling": "Krea 2 Model Sampling",
     "KreaTwoStageSampler": "Two-Stage Sampler",
+    "KreaThreeStageSampler": "Three-Stage Sampler",
 }
