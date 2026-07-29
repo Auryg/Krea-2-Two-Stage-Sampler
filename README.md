@@ -2,11 +2,19 @@
 
 
 
-Right now this repo includes two nodes for ComfyUI:
+Right now this repo includes four nodes for ComfyUI:
 
 
 
 A Sigma-locked two-stage sampler with separate inputs for models for each.  The general thinking was to run several steps of a base/raw model for better variation between seeds, and then finish it off with an extracted turbo lora on the second stage for both speed and possibly higher quality. It also has support for running two resolutions, so you can run the first stage at a lower, faster resolution.  The neat thing is that you can choose a percentage and any amount of steps for the first and second stage and it will change over with the original noise (if not upscaling) at just the right sigma values.
+
+The stage 1 schedule owns the stage 1-to-stage 2 boundary. Changing stage 2 model-sampling settings can change where stage 2 enters its own schedule, but it does not change stage 1's steps or boundary sigma.
+
+
+
+The three-stage sampler adds a final pass that reuses all of the stage 1 settings (including its model, steps, CFG, sampler, and scheduler). `handoff_percent` controls the stage 1 to stage 2 transition, while `stage3_handoff_percent` controls the later stage 2 to stage 3 transition.
+
+The Krea 2 Model Sampling node provides `raw_dynamic`, `turbo_fixed`, and `manual` modes. `raw_dynamic` follows Krea 2's resolution-dependent Raw schedule (`0.5` at 256x256 through `1.15` at 1280x1280). `turbo_fixed` pins the shift to `1.15`, as expected by the distilled Turbo sampling regime.
 
 
 
