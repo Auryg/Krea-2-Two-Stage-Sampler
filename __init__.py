@@ -1,9 +1,13 @@
+import importlib
 import math
 import random
+from pathlib import Path
 
 import torch
 
+import comfy.latent_formats
 import comfy.model_management
+import comfy.model_patcher
 import comfy.model_sampling
 import comfy.sample
 import comfy.samplers
@@ -40,7 +44,7 @@ RANDOM_ASPECT_RATIO_MODES = {
 
 
 ASPECT_RATIOS = {**dict.fromkeys(RANDOM_ASPECT_RATIO_MODES), **FIXED_ASPECT_RATIOS}
-UPSCALE_METHODS = ["nearest-exact", "bilinear", "area", "bicubic", "bislerp"]
+UPSCALE_METHODS = ["nearest-exact", "bilinear", "area", "bicubic", "bislerp", "sesquilsr_wan21"]
 
 
 def _round_to_multiple(value, multiple):
@@ -351,6 +355,38 @@ def _will_upscale_latent(latent, model, final_width, final_height):
     return target_latent_width != samples.shape[-1] or target_latent_height != samples.shape[-2]
 
 
+def _sesqui_upscale(samples, model, target_width, target_height):
+    if not isinstance(model.get_model_object("latent_format"), comfy.latent_formats.Wan21):
+        raise ValueError("sesquilsr_wan21 requires a Wan 2.1 VAE latent format, such as Krea 2.")
+    if "SesquiLatentUpscale" not in nodes.NODE_CLASS_MAPPINGS:
+        raise RuntimeError("Install SesquiLSR in custom_nodes and restart ComfyUI to use sesquilsr_wan21.")
+    if samples.ndim not in (4, 5) or samples.shape[1] != 16:
+        raise ValueError("sesquilsr_wan21 expects [B, 16, H, W] or [B, 16, T, H, W] latents.")
+
+    # SesquiLSR adds its package to sys.path when its custom node is loaded.
+    sesqui = importlib.import_module("sesqui_lsr")
+    weights = Path(sesqui.__file__).resolve().parent.parent / "models" / "upscaler_Wan21.safetensors"
+    upscaler = sesqui.LatentUpscaler(in_channels=16)
+    upscaler.load_state_dict(comfy.utils.load_torch_file(str(weights), safe_load=True))
+    upscaler.eval()
+    device = comfy.model_management.get_torch_device()
+    patcher = comfy.model_patcher.CoreModelPatcher(upscaler, load_device=device, offload_device=torch.device("cpu"))
+    working_pixels = max(4 * samples.shape[-2] * samples.shape[-1], target_height * target_width)
+    # Sampler outputs are already in raw VAE space; do not apply Wan normalization again.
+    frames = samples.movedim(1, -3).reshape(-1, 16, *samples.shape[-2:])
+    result = torch.empty((frames.shape[0], 16, target_height, target_width), device=samples.device, dtype=samples.dtype)
+    try:
+        comfy.model_management.load_models_gpu([patcher], memory_required=working_pixels * 128 * 4 * 16, force_full_load=True)
+        for index in range(frames.shape[0]):
+            frame = frames[index:index + 1].to(device=device, dtype=torch.float32)
+            result[index:index + 1] = upscaler(frame, (target_height, target_width)).to(device=samples.device, dtype=samples.dtype)
+    finally:
+        patcher.detach()
+    if samples.ndim == 5:
+        result = result.reshape(samples.shape[0], samples.shape[2], 16, target_height, target_width).movedim(2, 1)
+    return result
+
+
 def _upscale_latent_if_needed(latent, model, final_width, final_height, upscale_method):
     if final_width == 0 and final_height == 0:
         return latent, False
@@ -362,6 +398,9 @@ def _upscale_latent_if_needed(latent, model, final_width, final_height, upscale_
         return latent, False
 
     out = latent.copy()
+    if upscale_method == "sesquilsr_wan21":
+        out["samples"] = _sesqui_upscale(samples, model, target_latent_width, target_latent_height)
+        return out, True
     out["samples"] = comfy.utils.common_upscale(
         samples,
         target_latent_width,
@@ -527,6 +566,10 @@ class KreaTwoStageSampler:
                 "final_height": ("INT", {"default": 0, "min": 0, "max": nodes.MAX_RESOLUTION, "step": 8}),
                 "upscale_method": (UPSCALE_METHODS, {"default": "bislerp", "advanced": True}),
             },
+            "optional": {
+                "stage2_positive_optional": ("CONDITIONING", {"tooltip": "Stage 2 positive conditioning. Uses positive when unconnected."}),
+                "stage2_negative_optional": ("CONDITIONING", {"tooltip": "Stage 2 negative conditioning. Uses negative when unconnected; zeroed at stage 2 CFG 1."}),
+            },
         }
 
     RETURN_TYPES = ("LATENT",)
@@ -554,7 +597,11 @@ class KreaTwoStageSampler:
         final_width,
         final_height,
         upscale_method="bislerp",
+        stage2_positive_optional=None,
+        stage2_negative_optional=None,
     ):
+        stage2_positive = positive if stage2_positive_optional is None else stage2_positive_optional
+        stage2_negative = negative if stage2_negative_optional is None else stage2_negative_optional
         if handoff_percent <= 0.0:
             stage2_sigmas = _sigma_schedule(
                 stage2_model,
@@ -570,9 +617,9 @@ class KreaTwoStageSampler:
                 upscale_method,
             )
             stage2_negative = (
-                _zero_out_conditioning(negative)
+                _zero_out_conditioning(stage2_negative)
                 if math.isclose(stage2_cfg, 1.0, rel_tol=0.0, abs_tol=1e-6)
-                else negative
+                else stage2_negative
             )
             print(
                 "Krea Two-Stage Sampler: "
@@ -585,7 +632,7 @@ class KreaTwoStageSampler:
                 stage2_cfg,
                 stage2_sampler_name,
                 stage2_scheduler,
-                positive,
+                stage2_positive,
                 stage2_negative,
                 stage2_input,
                 stage2_sigmas,
@@ -654,7 +701,7 @@ class KreaTwoStageSampler:
         )
 
         stage1, did_upscale = _upscale_latent_if_needed(stage1, stage2_model, final_width, final_height, upscale_method)
-        stage2_negative = _zero_out_conditioning(negative) if math.isclose(stage2_cfg, 1.0, rel_tol=0.0, abs_tol=1e-6) else negative
+        stage2_negative = _zero_out_conditioning(stage2_negative) if math.isclose(stage2_cfg, 1.0, rel_tol=0.0, abs_tol=1e-6) else stage2_negative
 
         stage2 = _sample_with_sigmas(
             stage2_model,
@@ -662,7 +709,7 @@ class KreaTwoStageSampler:
             stage2_cfg,
             stage2_sampler_name,
             stage2_scheduler,
-            positive,
+            stage2_positive,
             stage2_negative,
             stage1,
             stage2_sigmas,
@@ -719,6 +766,8 @@ class KreaThreeStageSampler(KreaTwoStageSampler):
         final_width,
         final_height,
         upscale_method="bislerp",
+        stage2_positive_optional=None,
+        stage2_negative_optional=None,
     ):
         if stage3_handoff_percent < handoff_percent:
             raise ValueError(
@@ -746,6 +795,8 @@ class KreaThreeStageSampler(KreaTwoStageSampler):
                 final_width,
                 final_height,
                 upscale_method,
+                stage2_positive_optional=stage2_positive_optional,
+                stage2_negative_optional=stage2_negative_optional,
             )
 
         stage1_negative = negative
@@ -921,10 +972,12 @@ class KreaThreeStageSampler(KreaTwoStageSampler):
                 f"stage1_boundary_sigma={stage1_boundary_sigma:.8f}"
             )
 
+        stage2_positive = positive if stage2_positive_optional is None else stage2_positive_optional
+        stage2_negative = negative if stage2_negative_optional is None else stage2_negative_optional
         stage2_negative = (
-            _zero_out_conditioning(negative)
+            _zero_out_conditioning(stage2_negative)
             if math.isclose(stage2_cfg, 1.0, rel_tol=0.0, abs_tol=1e-6)
-            else negative
+            else stage2_negative
         )
         print(
             "Krea Three-Stage Sampler: "
@@ -939,7 +992,7 @@ class KreaThreeStageSampler(KreaTwoStageSampler):
             stage2_cfg,
             stage2_sampler_name,
             stage2_scheduler,
-            positive,
+            stage2_positive,
             stage2_negative,
             stage2_input,
             stage2_sigmas,

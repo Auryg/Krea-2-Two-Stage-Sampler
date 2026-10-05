@@ -12,6 +12,8 @@ I've also included a dual resolution node—select the aspect ratio and the base
 
 The three-stage sampler adds a final pass that reuses all of the stage 1 settings (including its model, steps, CFG, sampler, and scheduler). `handoff_percent` controls the stage 1 to stage 2 transition, while `stage3_handoff_percent` controls the later stage 2 to stage 3 transition.  This can be helpful if you want to apply negative conditioning to the beginning and end of a generation.
 
+Both samplers accept `stage2_positive_optional` and `stage2_negative_optional` for separate stage 2 conditioning. Unconnected inputs reuse `positive` and `negative`; stages 1 and 3 use the original conditioning. At stage 2 CFG 1, the selected negative conditioning is zeroed.
+
 The Krea 2 Model Sampling node provides `raw_dynamic`, `turbo_fixed`, and `manual` modes. `raw_dynamic` follows Krea 2's resolution-dependent Raw schedule (`0.5` at 256x256 through `1.15` at 1280x1280). `turbo_fixed` pins the shift to `1.15`, as expected by the distilled Turbo sampling regime.  ComfyUI doesn't set the shift correctly for non-turbo Krea 2, so it might be worth a shot to use this when not using the turbo model or checkpoint - like you might for stage one.
 
 
@@ -20,6 +22,14 @@ The main knob you'll want to play with is `handoff_percent`, which sets the poin
 Installation: Put in the custom_nodes folder or grab from ComfyUI manager. 
 
 
+
+### SesquiLSR latent upscaling
+
+Install [SesquiLSR](https://github.com/LoganBooker/SesquiLSR) alongside this node pack and restart ComfyUI. In either sampler, select `sesquilsr_wan21` under the advanced `upscale_method` setting and set `final_width` / `final_height` as usual. It uses SesquiLSR's bundled `models/upscaler_Wan21.safetensors` for Krea 2's VAE, with exact target dimensions and no VAE round-trip. This option is for Wan 2.1 VAE latents, not Flux latents.
+
+The resize happens after stage 1 produces a clean latent estimate, before stage 2 adds fresh noise at the handoff sigma. The three-stage sampler uses the same resize; stage 3 continues at the final resolution. Existing interpolation options and defaults are unchanged.
+
+SesquiLSR is trained for 1–2x scaling per spatial dimension (1 MP to 2 MP is about 1.41x). Larger or smaller targets are passed through but are outside that training range. An extremely early handoff still starts from an immature image estimate, so compare several handoff settings with the same seed. Learned upscaling can preserve detail better but cannot guarantee detail that the first stage has not developed.
 
 Here's an image with a sample workflow embedded:
 
